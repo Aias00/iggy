@@ -31,8 +31,8 @@ use std::fmt;
 /// Number of bytes [`VsrState::to_bytes`] produces: `cluster`(16) +
 /// `replica_id`(1) + `replica_count`(1) + `view`(4) + `log_view`(4) +
 /// `commit_max`(8) + `checkpoint_op`(8) + `checkpoint_checksum`(16) +
-/// `offset_frontier`(8).
-pub const ENCODED_LEN: usize = 66;
+/// `offset_frontier`(8) + `offset_reserved`(8).
+pub const ENCODED_LEN: usize = 74;
 
 /// The layout before `offset_frontier` was appended.
 ///
@@ -97,6 +97,20 @@ pub struct VsrState {
     ///
     /// Always `0` on the metadata plane, which mints no message offsets.
     pub offset_frontier: u64,
+    /// PARTITION plane: a monotone CEILING on the offsets this replica may
+    /// already have minted, claimed ahead of the counter in blocks so an append
+    /// pays one superblock write per block instead of one per batch.
+    ///
+    /// Never folded into [`Self::offset_frontier`]. The frontier is a claim
+    /// about DATA, which state transfer's rewind guard refuses to destroy; a
+    /// reservation names no bytes, only "an offset up to here may have reached
+    /// a client". Comparing an offer against it refuses every legitimate offer
+    /// below the lease headroom, and the replica cycles transfer -> refusal ->
+    /// backoff forever. Boot seeds the mint counter from both; the rewind guard
+    /// reads the frontier alone.
+    ///
+    /// Always `0` on the metadata plane, which mints no message offsets.
+    pub offset_reserved: u64,
 }
 
 impl VsrState {
@@ -113,6 +127,7 @@ impl VsrState {
         out[34..42].copy_from_slice(&self.checkpoint_op.to_le_bytes());
         out[42..58].copy_from_slice(&self.checkpoint_checksum.to_le_bytes());
         out[58..66].copy_from_slice(&self.offset_frontier.to_le_bytes());
+        out[66..74].copy_from_slice(&self.offset_reserved.to_le_bytes());
         out
     }
 }
@@ -121,11 +136,15 @@ impl TryFrom<&[u8]> for VsrState {
     type Error = VsrStateError;
 
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
-        // Length-tolerant: a pre-`offset_frontier` record is padded out and the
-        // new field reads as 0, which is exactly "no recorded frontier" (the
-        // read sites filter it). One length check up front then puts every
-        // field slice below in bounds by construction, so the `try_into`s
-        // cannot fail.
+        // Length-tolerant for ONE legacy layout: a pre-`offset_frontier` record
+        // pads out and its trailing fields read as 0, which the read sites
+        // filter. The one length check then puts every field slice below in
+        // bounds by construction, so the `try_into`s cannot fail.
+        //
+        // `offset_reserved` gets no tolerance of its own: a silent 0 reads as
+        // "nothing reserved" and re-mints confirmed offsets, the exact defect
+        // the field closes, so a frontier-but-no-reservation record is refused.
+        // Pre-production, so an older data directory is wiped, not migrated.
         let mut padded = [0u8; ENCODED_LEN];
         match bytes.len() {
             ENCODED_LEN => padded.copy_from_slice(bytes),
@@ -150,6 +169,7 @@ impl TryFrom<&[u8]> for VsrState {
             checkpoint_op: u64::from_le_bytes(field(bytes, 34)),
             checkpoint_checksum: u128::from_le_bytes(field(bytes, 42)),
             offset_frontier: u64::from_le_bytes(field(bytes, 58)),
+            offset_reserved: u64::from_le_bytes(field(bytes, 66)),
         };
         // A record violating `log_view <= view` decodes into a replica that looks
         // healthy locally while `DoViewChangeHeader::validate` makes every peer drop
@@ -224,7 +244,8 @@ mod tests {
             commit_max: 6,
             checkpoint_op: 7,
             checkpoint_checksum: 8,
-            offset_frontier: 0,
+            offset_frontier: 9,
+            offset_reserved: 10,
         };
         let bytes = state.to_bytes();
         assert_eq!(bytes.len(), ENCODED_LEN);
@@ -236,6 +257,8 @@ mod tests {
         assert_eq!(bytes[26], 6, "commit_max low byte");
         assert_eq!(bytes[34], 7, "checkpoint_op low byte");
         assert_eq!(bytes[42], 8, "checkpoint_checksum low byte");
+        assert_eq!(bytes[58], 9, "offset_frontier low byte");
+        assert_eq!(bytes[66], 10, "offset_reserved low byte");
 
         assert_eq!(VsrState::try_from(&bytes[..]).unwrap(), state);
         assert!(VsrState::try_from(&bytes[..ENCODED_LEN - 1]).is_err());
@@ -257,12 +280,14 @@ mod tests {
             checkpoint_op: 7,
             checkpoint_checksum: 5,
             offset_frontier: 77,
+            offset_reserved: 88,
         }
         .to_bytes();
 
         let legacy = &full[..ENCODED_LEN_WITHOUT_FRONTIER];
         let decoded = VsrState::try_from(legacy).expect("a pre-frontier record must decode");
         assert_eq!(decoded.offset_frontier, 0, "the new field zero-fills");
+        assert_eq!(decoded.offset_reserved, 0, "the new field zero-fills");
         assert_eq!(decoded.view, 9);
         assert_eq!(decoded.log_view, 8);
         assert_eq!(decoded.commit_max, 41);
@@ -274,6 +299,16 @@ mod tests {
             VsrState::try_from(&full[..40]),
             Err(VsrStateError::WrongLength { .. })
         ));
+
+        // Including the frontier-but-no-reservation layout every earlier build
+        // wrote: zero-filling it would let a restart re-mint confirmed offsets.
+        assert!(
+            matches!(
+                VsrState::try_from(&full[..ENCODED_LEN - 8]),
+                Err(VsrStateError::WrongLength { .. })
+            ),
+            "a record without the reservation must not zero-fill it"
+        );
     }
 
     #[test]
@@ -294,9 +329,11 @@ mod tests {
             // Distinct and nonzero: with 0 here a transposed write over the
             // trailing field would still satisfy every assertion below.
             offset_frontier: 9,
+            offset_reserved: 11,
         }
         .to_bytes();
         assert_eq!(bytes[58], 9, "offset_frontier must occupy bytes 58..66");
+        assert_eq!(bytes[66], 11, "offset_reserved must occupy bytes 66..74");
         bytes[22] = 5; // log_view = 5, view stays 4
 
         assert_eq!(

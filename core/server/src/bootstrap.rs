@@ -1936,6 +1936,7 @@ async fn build_shard_for_thread(
         let namespace = IggyNamespace::new(stream_id, topic_id, partition_metadata.id);
         let partition = match load_partition(
             config,
+            partitions.config(),
             namespace,
             Arc::clone(&partition_stats),
             &partition_metadata,
@@ -2627,6 +2628,7 @@ async fn recover_partition_segments(
 #[allow(clippy::too_many_arguments)]
 async fn load_partition(
     config: &ServerConfig,
+    partitions_config: &PartitionsConfig,
     namespace: IggyNamespace,
     stats: Arc<PartitionStats>,
     partition_metadata: &Partition,
@@ -2716,6 +2718,7 @@ async fn load_partition(
         config.partition.evicted_ring_capacity,
         config.partition.evicted_ring_bytes_max.as_bytes_u64(),
     );
+    partition.set_offset_reservation_lease(config.partition.offset_reservation_lease);
     partition.set_partition_dir(partition_dir.clone());
     // Before the hydrate: the durable record is keyed by incarnation, so a
     // `purge.gen` left behind by a previous life of this namespace reads 0.
@@ -2775,6 +2778,19 @@ async fn load_partition(
     // gone (an all-GC'd origin's install, a crash inside the swap window), and
     // taking the max means real recovered data always wins.
     partition.restore_offset_frontier(recovered_state.as_ref());
+    // Minting from the reservation leaves a hole between the recovered chain
+    // and the new append point, and the recovery walk truncates at a hole
+    // INSIDE a segment, so put it on a segment boundary instead.
+    //
+    // Solo only, in step with the floor itself: a replicated group's segment
+    // boundaries must be a function of the batches alone or the reconciler's
+    // offset-keyed segment GC never converges.
+    if partition.consensus().replica_count() == 1 {
+        partition
+            .reanchor_to_offset_frontier(partitions_config)
+            .await
+            .map_err(|error| ServerError::Iggy(Box::new(error)))?;
+    }
     let current_offset = partition.offset.load(Ordering::Acquire);
 
     configure_consumer_offsets(&mut partition, config, namespace, current_offset)?;
@@ -4539,6 +4555,21 @@ mod tests {
             config_default as u64,
             shard::REPAIR_CHUNK_MAX,
             "[cluster] repair_chunk_max default drifted from shard::REPAIR_CHUNK_MAX"
+        );
+    }
+
+    #[test]
+    fn default_offset_reservation_lease_matches_common_constant() {
+        // `IggyPartition::new` falls back to the common constant (simulator,
+        // unit tests) while boot installs this one, so drift would have the
+        // fence write at a different rate in the simulator than in production.
+        let config_default =
+            configs::partition::PartitionConfig::default().offset_reservation_lease;
+        assert_eq!(
+            config_default,
+            iggy_common::DEFAULT_OFFSET_RESERVATION_LEASE,
+            "[partition] offset_reservation_lease default drifted from \
+             iggy_common::DEFAULT_OFFSET_RESERVATION_LEASE"
         );
     }
 

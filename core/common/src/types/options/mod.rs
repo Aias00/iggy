@@ -259,6 +259,15 @@ pub const DEFAULT_PREALLOCATE_SEGMENTS: bool = false;
 /// 1 MiB (was `[system.partition] size_of_messages_required_to_save`).
 pub const DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE: u64 = 1024 * 1024;
 
+/// Offsets a partition claims in its superblock ahead of the mint counter
+/// before it will append, so a crash-restarted replica resumes above every
+/// offset it confirmed instead of re-minting it.
+///
+/// One superblock write (two fsyncs) per block: at 100k messages/s a 1Ki block
+/// costs ~200 fsyncs/s, 64Ki costs ~3/s. The waste is at most one block of a
+/// `u64` space per crash, visible only as a segment boundary at boot.
+pub const DEFAULT_OFFSET_RESERVATION_LEASE: u32 = 64 * 1024;
+
 /// Every runtime knob at its default, for a partition built with no resolved
 /// topic options (simulator, unit tests).
 impl Default for TopicRuntimeDefaults {

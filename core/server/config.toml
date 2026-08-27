@@ -973,6 +973,14 @@ clients_table_max = 8192
 # u128 bitset, and this depth bounds that suffix.
 prepare_queue_depth = 32
 
+# How many offsets a partition claims in its superblock ahead of the mint
+# counter before it will append, so a crash-restarted replica resumes above
+# every offset it confirmed to a client instead of re-minting it for a different
+# message. One superblock write (two fsyncs) per block: lowering it raises the
+# fsync rate on the write path, raising it wastes at most one block of the u64
+# offset space per crash. Must be > 0 and <= 16777216.
+offset_reservation_lease = 65536
+
 # Entries the evicted ring retains per multi-replica partition for journal
 # repair after a peer rejoins. Larger widens the window a restarting peer can be
 # served from the ring before falling back to bulk sync, at the cost of pinned

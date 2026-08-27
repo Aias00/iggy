@@ -6762,6 +6762,20 @@ where
                 // after this flush). A partition already fenced by the commit
                 // path keeps its original fault.
                 partition.fence_flush_failure();
+                // The collapse below claims the segments account for every
+                // confirmed offset, which a failed flush is exactly the case
+                // against, so leave the reservation standing.
+                continue;
+            }
+            // The segments now prove where the offset space ends, so the
+            // reservation has nothing left to witness. Without the collapse
+            // every clean stop would leave a lease-block-wide hole.
+            if !partition.collapse_offset_reservation().await {
+                tracing::warn!(
+                    namespace_raw = namespace.inner(),
+                    "could not collapse the offset reservation on shutdown; the restart \
+                     will resume above it and leave a gap in the offset space"
+                );
             }
         }
     }

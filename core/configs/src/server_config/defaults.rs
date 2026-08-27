@@ -174,6 +174,7 @@ impl Default for PartitionConfig {
         let partition = &SERVER_CONFIG.partition;
         PartitionConfig {
             prepare_queue_depth: partition.prepare_queue_depth as usize,
+            offset_reservation_lease: partition.offset_reservation_lease as u32,
             evicted_ring_capacity: partition.evicted_ring_capacity as usize,
             evicted_ring_bytes_max: partition.evicted_ring_bytes_max.parse().unwrap(),
             transfer_served_cache_bytes_max: partition

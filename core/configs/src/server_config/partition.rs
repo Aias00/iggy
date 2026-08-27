@@ -97,6 +97,10 @@ pub const DEFAULT_TRANSFER_SERVED_CACHE_BYTES_MAX: u64 =
 /// count.
 pub const MAX_TRANSFER_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
+/// Upper bound on `offset_reservation_lease`: a typo guard, so a slipped digit
+/// cannot reach the `saturating_add` in the append fence.
+pub const MAX_OFFSET_RESERVATION_LEASE: u32 = 16 * 1024 * 1024;
+
 /// Mirrors `partitions::EVICTED_RING_CAPACITY`.
 pub const DEFAULT_EVICTED_RING_CAPACITY: usize = 4096;
 
@@ -122,6 +126,13 @@ pub struct PartitionConfig {
     /// path the SDK retries. Applies to every partition; raising it multiplies
     /// pinned request-buffer memory by the partition count.
     pub prepare_queue_depth: usize,
+
+    /// Offsets claimed in the superblock ahead of the mint counter before an
+    /// append, so a crash-restarted replica resumes above what it confirmed.
+    /// One superblock write per block: lowering it raises the fsync rate,
+    /// raising it wastes at most one block per crash. Must be > 0 and <=
+    /// [`MAX_OFFSET_RESERVATION_LEASE`].
+    pub offset_reservation_lease: u32,
 
     /// Entries the evicted ring retains per multi-replica partition for
     /// journal repair after a peer rejoins. Larger widens the window a
@@ -174,6 +185,16 @@ impl Validatable<ConfigurationError> for PartitionConfig {
                  bitset, and this depth bounds that suffix. Deeper produces entries a new \
                  primary can neither adopt nor prove dead. Lowered from 256; not raisable.",
                 self.prepare_queue_depth
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.offset_reservation_lease == 0
+            || self.offset_reservation_lease > MAX_OFFSET_RESERVATION_LEASE
+        {
+            eprintln!(
+                "{COMPONENT} partition.offset_reservation_lease ({}) must be > 0 and <= \
+                 {MAX_OFFSET_RESERVATION_LEASE}",
+                self.offset_reservation_lease
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }

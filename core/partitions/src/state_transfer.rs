@@ -1994,7 +1994,13 @@ where
         let purge_advances = offsets_wire.purge_generation > committed_purge_generation
             || (self.applied_purge_generation < committed_purge_generation
                 && offsets_wire.next_offset == 0);
-        let local_next_offset = self.offset_frontier();
+        // What this replica HOLDS, not the append counter: the two diverge once
+        // the counter is seeded from an offset reservation, which stands a lease
+        // block above the last message anywhere and names none of them. Against
+        // that, every legitimate offer inside the block reads as a rewind, and
+        // the replica that restarted with a reservation is exactly the one
+        // needing the transfer, so it would cycle refusal -> backoff forever.
+        let local_next_offset = self.held_offset_frontier();
         if !purge_advances && local_next_offset > 0 && offsets_wire.next_offset < local_next_offset
         {
             return Err(PartitionInstallError::OfferRewindsDurableData {
@@ -2044,7 +2050,7 @@ where
             self.reset_offset_frontier_at(offsets_wire.next_offset)
                 .await
         } else {
-            self.persist_offset_frontier_at(offsets_wire.next_offset)
+            self.install_offset_frontier_at(offsets_wire.next_offset)
                 .await
         };
         if !frontier_durable {
