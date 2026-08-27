@@ -509,7 +509,7 @@ where
             purge_deferred: false,
             durable_offset_frontier: Cell::new(0),
             durable_offset_reserved: Cell::new(0),
-            offset_reservation_lease: iggy_common::DEFAULT_OFFSET_RESERVATION_LEASE as u64,
+            offset_reservation_lease: u64::from(iggy_common::DEFAULT_OFFSET_RESERVATION_LEASE),
             mint_floor_pending: Cell::new(false),
             transfer: None,
             transfer_attempts: 0,
@@ -850,7 +850,7 @@ where
     /// nothing, it re-stamps what the primary sends and rejects anything that
     /// does not continue its own counter, so seeding from a ceiling would put it
     /// a lease block above its group and fork its chain. Applied at the point of
-    /// MINTING instead: see [`Self::mint_floor`].
+    /// MINTING instead: see `Self::mint_floor`.
     ///
     /// Lives HERE rather than in the server crate so the boot paths and the
     /// simulator share one implementation. A copy in the harness was a copy of
@@ -1161,7 +1161,7 @@ where
 
     /// [`Self::mint_floor`] without spending it, for the boot re-anchor, which
     /// has to know where the first mint will land before there is one.
-    fn armed_mint_floor(&self) -> u64 {
+    const fn armed_mint_floor(&self) -> u64 {
         if self.consensus.replica_count() > 1 || !self.mint_floor_pending.get() {
             return 0;
         }
