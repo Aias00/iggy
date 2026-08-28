@@ -33,6 +33,7 @@ use iggy_common::{IggyByteSize, IggyError, MAX_MESSAGE_SIZE_UPPER_BYTES, Partiti
 use partitions::state_transfer::STAGING_SUFFIX;
 use partitions::{IggyIndex, IggyIndexReader, Segment};
 use server_common::send_messages::{BatchHeader, COMMAND_HEADER_SIZE, decode_batch_slice};
+use server_common::sharding::IggyNamespace;
 use server_common::{SegmentStorage, yield_to_reactor};
 use std::fs;
 use std::io;
@@ -176,13 +177,15 @@ pub struct RecoveredSegment {
 #[allow(clippy::too_many_lines)]
 pub async fn load_persisted_segments(
     config: &ServerConfig,
-    stream_id: usize,
-    topic_id: usize,
-    partition_id: usize,
+    namespace: IggyNamespace,
     segment_size: IggyByteSize,
     enforce_fsync: bool,
     stats: &PartitionStats,
+    offset_reserved: u64,
 ) -> Result<Vec<RecoveredSegment>, ServerError> {
+    let stream_id = namespace.stream_id();
+    let topic_id = namespace.topic_id();
+    let partition_id = namespace.partition_id();
     let partition_path = config
         .system
         .get_partition_path(stream_id, topic_id, partition_id);
@@ -300,7 +303,7 @@ pub async fn load_persisted_segments(
 
     // Pass B: the chain guard reads only the planned bounds, so it can refuse
     // BEFORE anything is truncated.
-    ensure_contiguous_chain(identity, &planned)?;
+    ensure_contiguous_chain(identity, &planned, offset_reserved)?;
 
     // Pass C: the chain is accepted; make disk match the bounds and open
     // storage over them.
@@ -529,6 +532,10 @@ struct ScanScratch {
 /// chain and push `current_offset` past data this replica does not hold.
 /// Refuse loudly instead of serving a holed log.
 ///
+/// `offset_reserved` is the superblock's ceiling on offsets this replica may
+/// already have minted, and it is what separates the boot re-anchor's own
+/// gap from damage. See the hole arm below.
+///
 /// Runs on the planned bounds alone, BEFORE any truncation, so the segment
 /// files a refusal quarantines are exactly the bytes boot found. The refusal
 /// names the partition and its directory so the caller can fence THAT group
@@ -538,6 +545,7 @@ struct ScanScratch {
 fn ensure_contiguous_chain(
     identity: PartitionIdentity<'_>,
     planned: &[PlannedSegment],
+    offset_reserved: u64,
 ) -> Result<(), ServerError> {
     // Walked, decodable bytes across the whole chain: the refusals carry it
     // so the single-replica boot arm can tell a shape with nothing servable
@@ -567,7 +575,18 @@ fn ensure_contiguous_chain(
         }
         // `checked_add`, not `+`: an end offset at u64::MAX must read as a
         // hole (no start offset can follow it), not overflow.
-        if previous.end_offset.checked_add(1) != Some(next.start_offset) {
+        //
+        // A gap whose far side sits inside `offset_reserved` is the boot
+        // re-anchor's, not damage: `reanchor_to_offset_frontier` seals the
+        // recovered tail and plants the next segment at a frontier the
+        // superblock already claimed, so the skipped offsets were minted (or
+        // may have been) and no file was ever meant to hold them. Refusing it
+        // would tombstone the partition on the boot AFTER the one that fixed
+        // the re-mint. The ceiling is what bounds the leniency: a stray file
+        // splicing a gap ABOVE anything this replica claimed still refuses.
+        if previous.end_offset.checked_add(1) != Some(next.start_offset)
+            && next.start_offset > offset_reserved
+        {
             return Err(identity.refusal(PartitionRecoveryRefusal::Hole {
                 previous_start: previous.start_offset,
                 previous_end: previous.end_offset,
@@ -2584,21 +2603,35 @@ mod tests {
     }
 
     async fn recover(config: &ServerConfig) -> Result<Vec<RecoveredSegment>, ServerError> {
-        recover_under_fsync(config, false).await
+        recover_with(config, false, 0).await
     }
 
     async fn recover_under_fsync(
         config: &ServerConfig,
         enforce_fsync: bool,
     ) -> Result<Vec<RecoveredSegment>, ServerError> {
+        recover_with(config, enforce_fsync, 0).await
+    }
+
+    async fn recover_reserved(
+        config: &ServerConfig,
+        offset_reserved: u64,
+    ) -> Result<Vec<RecoveredSegment>, ServerError> {
+        recover_with(config, false, offset_reserved).await
+    }
+
+    async fn recover_with(
+        config: &ServerConfig,
+        enforce_fsync: bool,
+        offset_reserved: u64,
+    ) -> Result<Vec<RecoveredSegment>, ServerError> {
         load_persisted_segments(
             config,
-            STREAM_ID,
-            TOPIC_ID,
-            PARTITION_ID,
+            IggyNamespace::new(STREAM_ID, TOPIC_ID, PARTITION_ID),
             IggyByteSize::from(SEGMENT_MAX_SIZE),
             enforce_fsync,
             &PartitionStats::default(),
+            offset_reserved,
         )
         .await
     }
@@ -3016,6 +3049,52 @@ mod tests {
         assert_eq!(bytes_of(&first_index_path), first_index);
         assert_eq!(bytes_of(&next_messages_path), next_log);
         assert_eq!(bytes_of(&next_index_path), next_index);
+    }
+
+    #[compio::test]
+    async fn given_a_hole_inside_the_reservation_when_recovering_should_accept_the_chain() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        // The shape the boot re-anchor leaves: a sealed tail, then the next
+        // segment planted at a frontier the superblock already claimed.
+        write_segment(&config, 0, &encoded_batch(0, 3), &index_entry(0, 0));
+        write_segment(&config, 10, &encoded_batch(10, 1), &index_entry(10, 0));
+
+        let recovered = recover_reserved(&config, 10)
+            .await
+            .expect("a gap the reservation covers is the re-anchor's, not damage");
+
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].segment.start_offset, 0);
+        assert_eq!(recovered[1].segment.start_offset, 10);
+    }
+
+    #[compio::test]
+    async fn given_a_hole_above_the_reservation_when_recovering_should_still_refuse() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        write_segment(&config, 0, &encoded_batch(0, 3), &index_entry(0, 0));
+        write_segment(&config, 10, &encoded_batch(10, 1), &index_entry(10, 0));
+
+        // One below the gap's far side: a reservation that stops short of it
+        // never claimed those offsets, so the segment is a stray file.
+        let error = recover_reserved(&config, 9)
+            .await
+            .err()
+            .expect("a gap past the claimed ceiling must still refuse recovery");
+
+        assert!(
+            matches!(
+                &error,
+                ServerError::PartitionRecoveryRefused {
+                    reason: PartitionRecoveryRefusal::Hole { .. },
+                    ..
+                }
+            ),
+            "expected a hole refusal, got {error:?}"
+        );
     }
 
     #[compio::test]

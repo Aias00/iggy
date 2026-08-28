@@ -2593,6 +2593,7 @@ async fn recover_partition_segments(
     namespace: IggyNamespace,
     runtime_options: TopicRuntimeOptions,
     stats: &PartitionStats,
+    offset_reserved: u64,
 ) -> Result<Vec<RecoveredSegment>, ServerError> {
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
@@ -2605,12 +2606,11 @@ async fn recover_partition_segments(
         .unwrap_or(iggy_common::DEFAULT_ENFORCE_FSYNC);
     load_persisted_segments(
         config,
-        stream_id,
-        topic_id,
-        partition_id,
+        namespace,
         segment_size,
         enforce_fsync,
         stats,
+        offset_reserved,
     )
     .await
     .map_err(|source| {
@@ -2705,8 +2705,13 @@ async fn load_partition(
     // recovered message timestamp here, or an NTP rewind across a restart could
     // regress persisted `base_timestamp`.
 
+    // The chain guard needs the claimed ceiling to tell the boot re-anchor's
+    // own gap from damage, and the superblock is already open by here.
+    let reserved = recovered_state
+        .as_ref()
+        .map_or(0, |state| state.offset_reserved);
     let recovered_segments =
-        recover_partition_segments(config, namespace, runtime_options, &stats).await?;
+        recover_partition_segments(config, namespace, runtime_options, &stats, reserved).await?;
 
     let mut partition = IggyPartition::new(stats.clone(), consensus);
     partition.set_runtime_options(runtime_options);
@@ -2734,6 +2739,28 @@ async fn load_partition(
     )
     .await?;
 
+    partition.created_at = partition_metadata.created_at;
+    restore_partition_offsets(&mut partition, partitions_config, recovered_state.as_ref()).await?;
+    let current_offset = partition.offset.load(Ordering::Acquire);
+
+    configure_consumer_offsets(&mut partition, config, namespace, current_offset)?;
+    ensure_initial_segment(&mut partition, config, stream_id, topic_id, partition_id).await?;
+
+    Ok(partition)
+}
+
+/// Restore the offset counter of a recovered partition from what boot could
+/// prove about its offset space, then put the next append point where the
+/// recovery walk can read it back.
+///
+/// Three carriers, weakest last: the sized segments' end offset, an empty
+/// chain's file name (a state-transfer install at the group frontier), and the
+/// superblock's durable frontier as a lower bound over both.
+async fn restore_partition_offsets(
+    partition: &mut IggyPartition<Rc<IggyMessageBus>>,
+    partitions_config: &PartitionsConfig,
+    recovered_state: Option<&consensus::VsrState>,
+) -> Result<(), ServerError> {
     let sized_end = partition
         .log
         .segments()
@@ -2754,7 +2781,6 @@ async fn load_partition(
         .max()
         .filter(|&start| sized_end.is_none() && start > 0);
     let current_offset = sized_end.or_else(|| empty_frontier.map(|start| start - 1));
-    partition.created_at = partition_metadata.created_at;
     partition.recovered_durable_offset = sized_end;
     // The OFFSET COUNTER is restored from that file name (above), but the
     // `installed_frontier` CLAIM deliberately is not: the claim says "everything
@@ -2777,7 +2803,7 @@ async fn load_partition(
     // it is the only carrier left when the segments that named the frontier are
     // gone (an all-GC'd origin's install, a crash inside the swap window), and
     // taking the max means real recovered data always wins.
-    partition.restore_offset_frontier(recovered_state.as_ref());
+    partition.restore_offset_frontier(recovered_state);
     // Minting from the reservation leaves a hole between the recovered chain
     // and the new append point, and the recovery walk truncates at a hole
     // INSIDE a segment, so put it on a segment boundary instead.
@@ -2791,12 +2817,7 @@ async fn load_partition(
             .await
             .map_err(|error| ServerError::Iggy(Box::new(error)))?;
     }
-    let current_offset = partition.offset.load(Ordering::Acquire);
-
-    configure_consumer_offsets(&mut partition, config, namespace, current_offset)?;
-    ensure_initial_segment(&mut partition, config, stream_id, topic_id, partition_id).await?;
-
-    Ok(partition)
+    Ok(())
 }
 
 /// Reopen writers over a recovered segment chain.
