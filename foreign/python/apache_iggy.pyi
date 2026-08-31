@@ -1058,9 +1058,7 @@ class IggyClient:
         """
     def get_streams(self) -> collections.abc.Awaitable[list[Stream]]:
         r"""
-        Return all streams visible to the authenticated user.
-
-        The result is ordered by ascending numeric stream ID.
+        Return all streams.
 
         Returns:
             A list of `Stream` summaries.
@@ -1070,7 +1068,10 @@ class IggyClient:
                 `read_streams` or `manage_streams` permission, or the request fails.
         """
     def update_stream(
-        self, stream_id: builtins.str | builtins.int, name: builtins.str
+        self,
+        stream_id: builtins.str | builtins.int,
+        name: builtins.str,
+        options: builtins.dict[builtins.str, builtins.str] | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Rename a stream selected by name or numeric ID.
@@ -1080,13 +1081,19 @@ class IggyClient:
         and contain between 1 and 255 UTF-8 bytes. Renaming a stream to its current
         name succeeds without changing it.
 
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            name: New stream name as `str`.
+            options: Additional option keys as `dict[str, str] | None`, forwarded
+                to the server. Current server versions reject all stream update
+                option keys.
+
         Returns:
             None.
 
         Raises:
-            TypeError: If `stream_id` is neither `str` nor `int`, or `name` is not
-                `str`.
-            OverflowError: If an integer identifier is outside `0..=2**32 - 1`.
+            TypeError: If `stream_id` is not `str` or an integer in
+                `0..=2**32 - 1`, or `name` is not `str`.
             ValueError: If a string identifier is empty or exceeds 255 UTF-8 bytes.
             RuntimeError: If the client is not authenticated, the user lacks global
                 `manage_streams` or per-stream `manage_stream` permission, the
@@ -1107,8 +1114,8 @@ class IggyClient:
             None.
 
         Raises:
-            TypeError: If `stream_id` is neither `str` nor `int`.
-            OverflowError: If an integer identifier is outside `0..=2**32 - 1`.
+            TypeError: If `stream_id` is not `str` or an integer in
+                `0..=2**32 - 1`.
             ValueError: If a string identifier is empty or exceeds 255 UTF-8 bytes.
             RuntimeError: If the client is not authenticated, the user lacks global
                 `manage_streams` or per-stream `manage_stream` permission, the
@@ -1129,8 +1136,8 @@ class IggyClient:
             None.
 
         Raises:
-            TypeError: If `stream_id` is neither `str` nor `int`.
-            OverflowError: If an integer identifier is outside `0..=2**32 - 1`.
+            TypeError: If `stream_id` is not `str` or an integer in
+                `0..=2**32 - 1`.
             ValueError: If a string identifier is empty or exceeds 255 UTF-8 bytes.
             RuntimeError: If the client is not authenticated, the user lacks global
                 `manage_streams` or per-stream `manage_stream` permission, the
@@ -1974,6 +1981,11 @@ class StreamDetails:
     def messages_count(self) -> builtins.int: ...
     @property
     def topics_count(self) -> builtins.int: ...
+    @property
+    def topics(self) -> builtins.list[Topic]:
+        r"""
+        Returns the topics in the stream.
+        """
 
 @typing.final
 class StreamPermissions:
@@ -2233,7 +2245,7 @@ class Topic:
         r"""
         Options admission resolved for the keys the client did not send.
 
-        Same shape as [`Self::options`]. These would have resolved differently
+        Same shape as options. These would have resolved differently
         under another server configuration.
         """
 
@@ -2298,7 +2310,7 @@ class TopicDetails:
         r"""
         Options admission resolved for the keys the client did not send.
 
-        Same shape as [`Self::options`]. These would have resolved differently
+        Same shape as options. These would have resolved differently
         under another server configuration.
         """
     @property
